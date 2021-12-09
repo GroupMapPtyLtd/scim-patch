@@ -21,7 +21,7 @@ import {
     ScimMeta
 } from './types/types';
 import {parse, filter} from 'scim2-parse-filter';
-import deepEqual = require('fast-deep-equal');
+import { isSubsetOf } from 'is-subset-of';
 
 /*
  * Export types
@@ -404,7 +404,7 @@ function removeWithPatchValue<T>(arr: Array<T>, itemsToRemove: Array<T> | Record
 
     // patch value is a single item, we remove from the array all the similar items.
     if (!Array.isArray(itemsToRemove))
-        return arr.filter(item => !deepEqual(itemsToRemove, item));
+        return arr.filter(item => typeof itemsToRemove === 'object' ? !isSubsetOf(itemsToRemove, item) : itemsToRemove as any !== item);
 
     // Sometimes the patch value is an array (this is how it works with one-login, ex: [{"test":true}])
     // We iterate on all the values in the array to delete them all.
@@ -412,7 +412,7 @@ function removeWithPatchValue<T>(arr: Array<T>, itemsToRemove: Array<T> | Record
        if (Array.isArray(toRemove))
            throw new RemoveValueNestedArrayNotSupported();
 
-       arr = arr.filter(item => !deepEqual(toRemove, item));
+       arr = arr.filter(item => typeof toRemove === 'object' ? !isSubsetOf(toRemove, item) : toRemove as any !== item);
     });
 
     return arr;
