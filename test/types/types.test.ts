@@ -43,12 +43,14 @@ export interface ScimUser extends ScimResource {
         type?: string;
     }>;
     meta: ScimMeta & { resourceType: 'User' };
-    newProperty?: string;
+    newProperty?: string | null;
     newProperty3?: string;
     favorites?: {
         food?: string
     };
     'urn:ietf:params:scim:schemas:extension:enterprise:2.0:User'?: {
-        department: string;
+        organization?: string;
+        division?: string;
+        department?: string;
     }
 }

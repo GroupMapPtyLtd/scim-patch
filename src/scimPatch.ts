@@ -7,7 +7,10 @@ import {
     NoTarget,
     RemoveValueNestedArrayNotSupported,
     RemoveValueNotArray,
-    InvalidScimRemoveValue, FilterOnEmptyArray
+    InvalidScimRemoveValue,
+    FilterOnEmptyArray,
+    FilterArrayTargetNotFound,
+    InvalidRemoveOpPath
 } from './errors/scimErrors';
 import {
     ScimPatchSchema,
@@ -18,10 +21,13 @@ import {
     ScimPatchAddReplaceOperation,
     ScimPatch,
     ScimResource,
-    ScimMeta
+    ScimMeta,
+    NavigateOptions,
+    FilterWithQueryOptions,
+    ScimPatchOptions,
 } from './types/types';
 import {parse, filter} from 'scim2-parse-filter';
-import { isSubsetOf } from 'is-subset-of';
+import deepEqual = require('fast-deep-equal');
 
 /*
  * Export types
@@ -75,6 +81,9 @@ export function patchBodyValidation(body: ScimPatch): void {
     if (!body.schemas || !body.schemas.includes(PATCH_OPERATION_SCHEMA))
         throw new InvalidScimPatchRequest('Missing schemas.');
 
+    if (!Array.isArray(body.Operations))
+        throw new InvalidScimPatchRequest('Operations should be an array.');
+
     if (!body.Operations || body.Operations.length <= 0)
         throw new InvalidScimPatchRequest('Missing operations.');
 
@@ -85,10 +94,18 @@ export function patchBodyValidation(body: ScimPatch): void {
  * This method apply patch operations on a SCIM Resource.
  * @param scimResource The initial resource
  * @param patchOperations An array of SCIM patch operations we want to apply on the scimResource object.
+ * @param options Options to customize some behaviour of scimPatch
  * @return the scimResource patched.
  * @throws {InvalidScimPatchOp} if the patch could not happen.
  */
-export function scimPatch<T extends ScimResource>(scimResource: T, patchOperations: Array<ScimPatchOperation>): T {
+export function scimPatch<T extends ScimResource>(scimResource: T, patchOperations: Array<ScimPatchOperation>,
+                                                  options: ScimPatchOptions = {mutateDocument: true}): T {
+    if (!options.mutateDocument) {
+        // Deeply clone the object.
+        // https://jsperf.com/deep-copy-vs-json-stringify-json-parse/25 (recursiveDeepCopy)
+        scimResource = JSON.parse(JSON.stringify(scimResource));
+    }
+
     return patchOperations.reduce((patchedResource, patch) => {
         switch (patch.op) {
             case 'remove':
@@ -113,13 +130,13 @@ export function scimPatch<T extends ScimResource>(scimResource: T, patchOperatio
  * @throws {NoPathInScimPatchOp} if the operation is a remove with no path.
  */
 function validatePatchOperation(operation: ScimPatchOperation): void {
-    if (!operation.op || Array.isArray(operation.op) || !isValidOperation(operation.op))
+    if (typeof operation.op !== 'string' || !isValidOperation(operation.op))
         throw new InvalidScimPatchRequest(`Invalid op "${operation.op}" in the request.`);
 
     if (operation.op === 'remove' && !operation.path)
         throw new NoPathInScimPatchOp();
 
-    if (operation.op === 'add' && !('value' in operation))
+    if (isAddOperation(operation.op) && !('value' in operation))
         throw new InvalidScimPatchRequest(`The operation ${operation.op} MUST contain a "value" member whose content specifies the value to be added`);
 
     if (operation.path && typeof operation.path !== 'string')
@@ -156,7 +173,15 @@ function applyRemoveOperation<T extends ScimResource>(scimResource: T, patch: Sc
 
     // Path is supposed to be set, there are a validation in the validateOperation function.
     const paths = resolvePaths(patch.path);
-    resource = navigate(resource, paths);
+
+    try {
+        resource = navigate(resource, paths, {isRemoveOp: true});
+    } catch (error) {
+        if (error instanceof InvalidRemoveOpPath) {
+            return scimResource;
+        }
+        throw error;
+    }
 
     // Dealing with the last element of the path.
     const lastSubPath = paths[paths.length - 1];
@@ -178,7 +203,7 @@ function applyRemoveOperation<T extends ScimResource>(scimResource: T, patch: Sc
     const {attrName, valuePath, array} = extractArray(lastSubPath, resource);
 
     // We keep only items who don't match the query if supplied.
-    resource[attrName] = array.filter((e: any) => !filterWithQuery<any>(array, valuePath).includes(e));
+    resource[attrName] = filterWithQuery<any>(array, valuePath, {excludeIfMatchFilter: true});
 
     // If the complex multi-valued attribute has no remaining records, the attribute SHALL be considered unassigned.
     if (resource[attrName].length === 0)
@@ -203,29 +228,27 @@ function applyAddOrReplaceOperation<T extends ScimResource>(scimResource: T, pat
     try {
         resource = navigate(resource, paths);
     } catch(e) {
-        if (e instanceof FilterOnEmptyArray) {
+        if (e instanceof FilterOnEmptyArray || e instanceof FilterArrayTargetNotFound) {
             resource = e.schema;
             // check issue https://github.com/thomaspoignant/scim-patch/issues/42 to see why we should add this
             const parsedPath = parse(e.valuePath);
-            if (patch.op.toLowerCase() === "add" &&
+            if (isAddOperation(patch.op) &&
               "compValue" in parsedPath &&
               parsedPath.compValue !== undefined &&
               parsedPath.op === "eq"
             ) {
                 const result: any = {};
                 result[parsedPath.attrPath] = parsedPath.compValue;
-                result[lastSubPath] = addOrReplaceAttribute(resource, patch);
-                resource[e.attrName] = [result];
+                result[lastSubPath] = addOrReplaceAttribute(resource, patch, true);
+                resource[e.attrName] = [...(resource[e.attrName] ?? []), result];
                 return scimResource;
             }
+            throw new NoTarget(patch.path);
         }
         throw e;
     }
 
     if (!IS_ARRAY_SEARCH.test(lastSubPath)) {
-        if (resource === undefined) {
-            throw new NoTarget(patch.value);
-        }
         resource[lastSubPath] = addOrReplaceAttribute(resource[lastSubPath], patch);
         return scimResource;
     }
@@ -239,9 +262,8 @@ function applyAddOrReplaceOperation<T extends ScimResource>(scimResource: T, pat
     // If the target location is a multi-valued attribute for which a value selection filter ("valuePath") has been
     // supplied and no record match was made, the service provider SHALL indicate failure by returning HTTP status
     // code 400 and a "scimType" error code of "noTarget".
-    const isReplace = patch.op.toLowerCase() === 'replace';
-    if (isReplace && matchFilter.length === 0) {
-        throw new NoTarget(patch.value);
+    if (isReplaceOperation(patch.op) && matchFilter.length === 0) {
+        throw new NoTarget(patch.path);
     }
 
     // We are sure to find an index because matchFilter comes from array.
@@ -276,9 +298,10 @@ function extractArray(subPath: string, schema: any): ScimSearchQuery {
  * navigate allow to get the sub object who want to edit with the patch operation.
  * @param inputSchema the initial ScimResource
  * @param paths an Array who contains the path of the sub object
+ * @param options options used while calling navigate
  * @return the parent object of the element we want to edit
  */
-function navigate(inputSchema: any, paths: string[]): any {
+function navigate(inputSchema: any, paths: string[], options: NavigateOptions = {}): Record<string, unknown> {
     let schema = inputSchema;
     for (let i = 0; i < paths.length - 1; i++) {
         const subPath = paths[i];
@@ -286,11 +309,14 @@ function navigate(inputSchema: any, paths: string[]): any {
         // We check if the element is an array with query (ex: emails[primary eq true).
         if (IS_ARRAY_SEARCH.test(subPath)) {
             try {
-                const {valuePath, array} = extractArray(subPath, schema);
+                const {attrName, valuePath, array} = extractArray(subPath, schema);
                 // Get the item who is successful for the search query.
                 const matchFilter = filterWithQuery<any>(array, valuePath);
                 // We are sure to find an index because matchFilter comes from array.
                 const index = array.findIndex(item => matchFilter.includes(item));
+                if (index < 0) {
+                    throw new FilterArrayTargetNotFound('A matching array entry was not found using the supplied filter.', attrName, valuePath, schema);
+                }
                 schema = array[index];
             } catch (error) {
                 if(error instanceof FilterOnEmptyArray){
@@ -300,9 +326,10 @@ function navigate(inputSchema: any, paths: string[]): any {
             }
         } else {
             // The element is not an array.
-            if (!schema[subPath])
-                schema[subPath] = {};
-            schema = schema[subPath];
+            if (!schema[subPath] && options.isRemoveOp)
+                throw new InvalidRemoveOpPath();
+
+            schema = schema[subPath] || (schema[subPath] = {});
         }
     }
     return schema;
@@ -312,14 +339,15 @@ function navigate(inputSchema: any, paths: string[]): any {
  * Add or Replace a property in the ScimResource
  * @param property The property we want to replace
  * @param patch The patch operation
+ * @param multiValuedPathFilter True if thi is a multivalued path filter query
  * @return the patched property
  */
-function addOrReplaceAttribute(property: any, patch: ScimPatchAddReplaceOperation): any {
+function addOrReplaceAttribute(property: any, patch: ScimPatchAddReplaceOperation, multiValuedPathFilter?: boolean): any {
     if (Array.isArray(property)) {
         if (Array.isArray(patch.value)) {
             // if we're adding an array, we need to remove duplicated values from existing array
-            if (patch.op.toLowerCase() === "add") {
-                const valuesToAdd = patch.value.filter(item => !property.includes(item));
+            if (isAddOperation(patch.op)) {
+                const valuesToAdd = patch.value.filter(item => !deepIncludes(property, item));
                 return property.concat(valuesToAdd);
             }
             // else this is a replace operation
@@ -327,13 +355,13 @@ function addOrReplaceAttribute(property: any, patch: ScimPatchAddReplaceOperatio
         }
 
         const a = property;
-        if (!a.includes(patch.value))
+        if (!deepIncludes(a, patch.value))
             a.push(patch.value);
         return a;
     }
 
-    if (typeof property === 'object') {
-        return addOrReplaceObjectAttribute(property, patch);
+    if (property !== null && typeof property === 'object') {
+        return addOrReplaceObjectAttribute(property, patch, multiValuedPathFilter);
     }
 
     // If the target location specifies a single-valued attribute, the existing value is replaced.
@@ -344,10 +372,11 @@ function addOrReplaceAttribute(property: any, patch: ScimPatchAddReplaceOperatio
  * addOrReplaceObjectAttribute will add an attribute if it is an object
  * @param property The property we want to replace
  * @param patch The patch operation
+ * @param multiValuedPathFilter True if thi is a multivalued path filter query
  */
-function addOrReplaceObjectAttribute(property: any, patch: ScimPatchAddReplaceOperation): any {
+function addOrReplaceObjectAttribute(property: any, patch: ScimPatchAddReplaceOperation, multiValuedPathFilter?: boolean): any {
     if (typeof patch.value !== 'object') {
-        if (patch.op === 'add')
+        if (isAddOperation(patch.op) && !multiValuedPathFilter)
             throw new InvalidScimPatchOp('Invalid patch query.');
 
         return patch.value;
@@ -355,7 +384,7 @@ function addOrReplaceObjectAttribute(property: any, patch: ScimPatchAddReplaceOp
 
     // We add all the patch values to the property object.
     for (const [key, value] of Object.entries(patch.value)) {
-        assign(property, key.split('.'), value);
+        assign(property, resolvePaths(key), value, patch.op);
     }
     return property;
 }
@@ -365,8 +394,9 @@ function addOrReplaceObjectAttribute(property: any, patch: ScimPatchAddReplaceOp
  * @param obj the object where we should the key
  * @param keyPath an array which represent the path of the nested object
  * @param value value to assign
+ * @param op patch operation
  */
-function assign(obj:any, keyPath:Array<string>, value:any) {
+function assign(obj:any, keyPath:Array<string>, value:any, op: string) {
     const lastKeyIndex = keyPath.length-1;
     for (let i = 0; i < lastKeyIndex; ++ i) {
         const key = keyPath[i];
@@ -375,6 +405,21 @@ function assign(obj:any, keyPath:Array<string>, value:any) {
         }
         obj = obj[key];
     }
+
+    // If the attribute is an array and the operation is "add",
+    // then the value should be added to the array
+    const attribute = obj[keyPath[lastKeyIndex]];
+    if (isAddOperation(op) && Array.isArray(attribute)) {
+        // If the value is also an array, append all values of the array to the attribute
+        if (Array.isArray(value)) {
+            obj[keyPath[lastKeyIndex]] = [...attribute, ...value];
+            return;
+        }
+
+        // If value is not an array, simply append it as a whole to end of attribute
+        obj[keyPath[lastKeyIndex]] = [...attribute, value];
+        return;
+    }
     obj[keyPath[lastKeyIndex]] = value;
 }
 
@@ -382,11 +427,14 @@ function assign(obj:any, keyPath:Array<string>, value:any) {
  * Return the items in the array who match the filter.
  * @param arr the collection where we are searching.
  * @param querySearch the search request.
+ * @param options options used while calling filterWithQuery
  * @return an array who contains the search results.
  */
-function filterWithQuery<T>(arr: Array<T>, querySearch: string): Array<T> {
+function filterWithQuery<T>(arr: Array<T>, querySearch: string,
+                            options: FilterWithQueryOptions = ({} as FilterWithQueryOptions)): Array<T> {
     try {
-        return arr.filter(filter(parse(querySearch)));
+        const f = filter(parse(querySearch));
+        return arr.filter(e => options.excludeIfMatchFilter ? !f(e) : f(e));
     } catch (error) {
         throw new InvalidScimPatchOp(`${error}`);
     }
@@ -404,7 +452,7 @@ function removeWithPatchValue<T>(arr: Array<T>, itemsToRemove: Array<T> | Record
 
     // patch value is a single item, we remove from the array all the similar items.
     if (!Array.isArray(itemsToRemove))
-        return arr.filter(item => typeof itemsToRemove === 'object' ? !isSubsetOf(itemsToRemove, item) : itemsToRemove as any !== item);
+        return arr.filter(item => !deepEqual(itemsToRemove, item));
 
     // Sometimes the patch value is an array (this is how it works with one-login, ex: [{"test":true}])
     // We iterate on all the values in the array to delete them all.
@@ -412,14 +460,43 @@ function removeWithPatchValue<T>(arr: Array<T>, itemsToRemove: Array<T> | Record
        if (Array.isArray(toRemove))
            throw new RemoveValueNestedArrayNotSupported();
 
-       arr = arr.filter(item => typeof toRemove === 'object' ? !isSubsetOf(toRemove, item) : toRemove as any !== item);
+       arr = arr.filter(item => !deepEqual(toRemove, item));
     });
 
     return arr;
 }
 
+/**
+ * deepIncludes has similar behaviour as Array.prototype.includes,
+ * just that instead of === for equality check, it uses deepEqual library
+ * @param array the array on which inclusion check has to be performed
+ * @param item the item whose inclusion has to be checked
+ * @returns true if the item is present, else false
+ */
+function deepIncludes(array: any[], item: any): boolean {
+    return array.some(el => deepEqual(item, el));
+}
+
 function isValidOperation(operation: string): boolean {
     return AUTHORIZED_OPERATION.includes(operation.toLowerCase());
+}
+
+/**
+ * isAddOperation check if the operation is an ADD
+ * @param operation the name of the SCIM Patch operation
+ * @return true if this is an add operation
+ */
+function isAddOperation(operation: string): boolean {
+    return operation !== undefined && operation.toLowerCase() === 'add';
+}
+
+/**
+ * isReplaceOperation check if the operation is an REPACE
+ * @param operation the name of the SCIM Patch operation
+ * @return true if this is a replace operation
+ */
+function isReplaceOperation(operation: string): boolean {
+    return operation !== undefined && operation.toLowerCase() === 'replace';
 }
 
 class ScimSearchQuery {
